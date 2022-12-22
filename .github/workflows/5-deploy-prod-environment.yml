@@ -1,65 +1,97 @@
-name: Check step 5, Test the deploy to staging workflow
+name: Production deployment
 
-# This step triggers after a pull requst is merged to `main`
-# This step sets STEP to 6
-
-# This will run after the "Deploy to production"" workflow
-# completes on the production-deployment-workflow branch
-# Reference https://docs.github.com/en/actions/learn-github-actions/events-that-trigger-workflows
 on:
-  workflow_dispatch:
-  workflow_run:
-    workflows: ["Deploy to production"]
-    types: [completed]
-    branches: [main]
+  push:
+    branches:
+      - main
 
-permissions:
-  # Need `contents: read` to checkout the repository
-  # Need `contents: write` to update the step metadata
-  contents: write
+env:
+  IMAGE_REGISTRY_URL: ghcr.io
+  ###############################################
+  ### Replace <username> with GitHub username ###
+  ###############################################
+  DOCKER_IMAGE_NAME: <username>-azure-ttt
+  AZURE_WEBAPP_NAME: <username>-ttt-app
+  ###############################################
 
 jobs:
-  # The purpose of this job is to output the current step number 
-  # (retrieved from the STEP file). This output variable can
-  # then be referenced in other jobs and used in conditional 
-  # expressions.
-  get_current_step:
-    name: Check current step number
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - id: get_step
-        run: echo "::set-output name=current_step::$(cat ./.github/script/STEP)"
-    outputs:
-      current_step: ${{ steps.get_step.outputs.current_step }}
-
-  on_deploy_to_prod:
-    name: On deploy to production
-    needs: get_current_step
-
-    # We will only run this action when:
-    # 1. This repository isn't the template repository
-    # 2. The STEP is currently 5 (see skills/action-update-step)
-    # Reference https://docs.github.com/en/actions/learn-github-actions/contexts
-    # Reference https://docs.github.com/en/actions/learn-github-actions/expressions
-    if: ${{ !github.event.repository.is_template && needs.get_current_step.outputs.current_step == 5 }}
-
-    # We'll run Ubuntu for performance instead of Mac or Windows
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      # We'll need to check out the repository so that we can edit the README
+      - uses: actions/checkout@v3
+      - name: npm install and build webpack
+        run: |
+          npm install
+          npm run build
+      - uses: actions/upload-artifact@v3
+        with:
+          name: webpack artifacts
+          path: public/
+
+  Build-Docker-Image:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Build image and store in GitHub Container Registry
+    steps:
       - name: Checkout
         uses: actions/checkout@v3
-        with:
-          fetch-depth: 0 # Let's get all the branches
 
-      # Update README to close <details id=5> and open <details id=6>
-      # and set STEP to '6'
-      - name: Update to step 6
-        uses: skills/action-update-step@v1
+      - name: Download built artifact
+        uses: actions/download-artifact@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          from_step: 5
-          to_step: 6
+          name: webpack artifacts
+          path: public
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.IMAGE_REGISTRY_URL }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}
+          tags: |
+            type=sha,format=long,prefix=
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  Deploy-to-Azure:
+    runs-on: ubuntu-latest
+    needs: Build-Docker-Image
+    name: Deploy app container to Azure
+    steps:
+      - name: "Login via Azure CLI"
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - uses: azure/docker-login@v1
+        with:
+          login-server: ${{env.IMAGE_REGISTRY_URL}}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy web app container
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{env.AZURE_WEBAPP_NAME}}
+          images: ${{env.IMAGE_REGISTRY_URL}}/${{ github.repository }}/${{env.DOCKER_IMAGE_NAME}}:${{github.sha}}
+
+      - name: Azure logout via Azure CLI
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az logout
+            az cache purge
+            az account clear
